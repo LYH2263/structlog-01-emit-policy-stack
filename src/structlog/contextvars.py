@@ -88,16 +88,18 @@ def merge_contextvars(
     Use this as your first processor in :func:`structlog.configure` to ensure
     context-local context is included in all log calls.
 
+    The exact merge is governed by the context-merge dimension of the
+    :mod:`structlog.emit_policy` stack: without a pushed frame it is a
+    ``setdefault`` merge as described above.
+
     .. versionadded:: 20.1.0
     .. versionchanged:: 21.1.0 See toplevel note.
+    .. versionchanged:: 26.2.0
+       Honor the ``context_merge`` dimension of the emit-time policy stack.
     """
-    ctx = contextvars.copy_context()
+    from .emit_policy import apply_context_merge
 
-    for k in ctx:
-        if k.name.startswith(STRUCTLOG_KEY_PREFIX) and ctx[k] is not Ellipsis:
-            event_dict.setdefault(k.name[STRUCTLOG_KEY_PREFIX_LEN:], ctx[k])
-
-    return event_dict
+    return apply_context_merge(event_dict)
 
 
 def clear_contextvars() -> None:

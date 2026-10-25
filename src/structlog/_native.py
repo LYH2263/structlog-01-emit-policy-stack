@@ -30,15 +30,107 @@ from ._log_levels import (
     WARNING,
 )
 from .contextvars import _ASYNC_CALLING_STACK, _ASYNC_CALLING_THREAD
+
+# The method-level gate reads the gate projection ContextVar directly: this
+# is the hottest path in structlog (every suppressed log call ends here), so
+# it must be one ContextVar lookup with no extra function call on the
+# empty-stack fast path.
+from .emit_policy import _LEVEL_GATE_VAR, LevelGate
 from .typing import FilteringBoundLogger
 
 
-def _nop(self: Any, event: str, *args: Any, **kw: Any) -> Any:
-    return None
+def _gate_allows(
+    gate: tuple[LevelGate, int], level: int, configured_min_level: int
+) -> bool:
+    """
+    Apply a non-empty level-gate projection at the method layer.
+    """
+    mode, floor = gate
+    if mode is LevelGate.FORCE_EMIT:
+        # Bypass the method-layer no-op only; the event still runs the
+        # full processor chain and DropEvent is unchanged.
+        return True
+    if mode is LevelGate.RAISE_MIN:
+        return level >= configured_min_level and level >= floor
+
+    # ``pin``: the wrapper class' compiled threshold.
+    return level >= configured_min_level
 
 
-async def _anop(self: Any, event: str, *args: Any, **kw: Any) -> Any:
-    return None
+def _level_allows(level: int, configured_min_level: int) -> bool:
+    """
+    Decide at the *method-level gate* whether *level* is emitted.
+
+    This projection belongs to the filtering bound logger's method layer
+    only; it does not bypass the processor chain and does not change
+    `structlog.DropEvent` semantics.
+
+    With no pushed frame (or a ``pin`` frame), the wrapper class' compiled
+    threshold is the only check.  ``raise_min`` takes the stricter of the
+    frame floor and the configured threshold, ``force_emit`` bypasses the
+    method-level no-op.
+    """
+    gate = _LEVEL_GATE_VAR.get()
+    if gate is None:
+        return level >= configured_min_level
+
+    return _gate_allows(gate, level, configured_min_level)
+
+
+def _effective_min_level(configured_min_level: int) -> int:
+    """
+    Return the effective threshold exposed via ``get_effective_level()``.
+    """
+    gate = _LEVEL_GATE_VAR.get()
+    if gate is None:
+        return configured_min_level
+
+    mode, floor = gate
+    if mode is LevelGate.FORCE_EMIT:
+        return NOTSET
+    if mode is LevelGate.RAISE_MIN:
+        return max(configured_min_level, floor)
+
+    return configured_min_level
+
+
+async def _run_in_executor_context(
+    self: Any,
+    emit: Callable[[], Any],
+    executor: Any = None,
+) -> Any:
+    """
+    Run the synchronous *emit* callable in an executor.
+
+    The whole current context -- including the emit-time policy stack -- is
+    copied before handing off, so the emission observes the stack top that
+    was active when the async log method was called, even if an outer frame
+    is popped before the executor runs.
+
+    The caller frame is captured at two calls deep: this helper is invoked
+    from the generated ``a*`` method (or ``aexception``), whose own caller
+    is the user frame.
+    """
+    # Capture thread-specific info before handing off to the executor.
+    thread_token = _ASYNC_CALLING_THREAD.set(
+        (threading.get_ident(), threading.current_thread().name)
+    )
+    # This helper is awaited from the generated method (one frame up), so
+    # the caller's frame is one step further out.
+    method_frame = sys._getframe().f_back
+    caller_frame = method_frame.f_back if method_frame is not None else None
+    scs_token = _ASYNC_CALLING_STACK.set(caller_frame)  # type: ignore[arg-type]
+    ctx = contextvars.copy_context()
+
+    try:
+        runner = await asyncio.get_running_loop().run_in_executor(
+            executor, lambda: ctx.run(emit)
+        )
+    finally:
+        _ASYNC_CALLING_STACK.reset(scs_token)
+        _ASYNC_CALLING_THREAD.reset(thread_token)
+
+    return runner
 
 
 def exception(
@@ -61,23 +153,11 @@ async def aexception(
     if kw.get("exc_info", True) is True:
         kw["exc_info"] = sys.exc_info()
 
-    # Capture thread-specific info before handing off to the executor.
-    thread_token = _ASYNC_CALLING_THREAD.set(
-        (threading.get_ident(), threading.current_thread().name)
+    # The level gate is consulted by the error() method inside the copied
+    # context, so the executor observes the same stack top as the caller.
+    return await _run_in_executor_context(
+        self, lambda: self.error(event, *args, **kw)
     )
-    scs_token = _ASYNC_CALLING_STACK.set(sys._getframe().f_back)  # type: ignore[arg-type]
-    ctx = contextvars.copy_context()
-
-    try:
-        runner = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: ctx.run(lambda: self.error(event, *args, **kw)),
-        )
-    finally:
-        _ASYNC_CALLING_STACK.reset(scs_token)
-        _ASYNC_CALLING_THREAD.reset(thread_token)
-
-    return runner
 
 
 def make_filtering_bound_logger(
@@ -160,15 +240,27 @@ def _make_filtering_bound_logger(min_level: int) -> type[FilteringBoundLogger]:
     of a ``return None``.
     """
 
+    # Bind the projection lookup as a closure cell to skip module globals on
+    # the hot path.
+    gate_get = _LEVEL_GATE_VAR.get
+
     def make_method(
         level: int,
     ) -> tuple[Callable[..., Any], Callable[..., Any]]:
-        if level < min_level:
-            return _nop, _anop
-
         name = LEVEL_TO_NAME[level]
 
         def meth(self: Any, event: str, *args: Any, **kw: Any) -> Any:
+            # The method-level gate reads the emit-time policy stack.  The
+            # empty-stack fast path stays a single ContextVar lookup plus
+            # the static comparison the class was compiled with; only when
+            # a frame is active do we pay for the policy resolution.
+            gate = gate_get()
+            if gate is None:
+                if level < min_level:
+                    return None
+            elif not _gate_allows(gate, level, min_level):
+                return None
+
             return self._proxy_to_logger(
                 name, _maybe_interpolate(event, args), **kw
             )
@@ -176,27 +268,23 @@ def _make_filtering_bound_logger(min_level: int) -> type[FilteringBoundLogger]:
         async def ameth(self: Any, event: str, *args: Any, **kw: Any) -> Any:
             """
             .. versionchanged:: 23.3.0
-               Callsite parameters are now also collected under asyncio.
+                Callsite parameters are now also collected under asyncio.
+            .. versionchanged:: 26.2.0
+                The emit-time policy stack is honored, including from the
+                context copied for the executor.
             """
+            gate = gate_get()
+            if gate is None:
+                if level < min_level:
+                    return None
+            elif not _gate_allows(gate, level, min_level):
+                return None
+
             event = _maybe_interpolate(event, args)
 
-            # Capture thread-specific info before handing off to the executor.
-            thread_token = _ASYNC_CALLING_THREAD.set(
-                (threading.get_ident(), threading.current_thread().name)
+            await _run_in_executor_context(
+                self, lambda: self._proxy_to_logger(name, event, **kw)
             )
-            scs_token = _ASYNC_CALLING_STACK.set(sys._getframe().f_back)  # type: ignore[arg-type]
-            ctx = contextvars.copy_context()
-
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: ctx.run(
-                        lambda: self._proxy_to_logger(name, event, **kw)
-                    ),
-                )
-            finally:
-                _ASYNC_CALLING_STACK.reset(scs_token)
-                _ASYNC_CALLING_THREAD.reset(thread_token)
 
         meth.__name__ = name
         ameth.__name__ = f"a{name}"
@@ -204,7 +292,7 @@ def _make_filtering_bound_logger(min_level: int) -> type[FilteringBoundLogger]:
         return meth, ameth
 
     def log(self: Any, level: int, event: str, *args: Any, **kw: Any) -> Any:
-        if level < min_level:
+        if not _level_allows(level, min_level):
             return None
         name = LEVEL_TO_NAME[level]
 
@@ -218,31 +306,18 @@ def _make_filtering_bound_logger(min_level: int) -> type[FilteringBoundLogger]:
         """
         .. versionchanged:: 23.3.0
            Callsite parameters are now also collected under asyncio.
+        .. versionchanged:: 26.2.0
+           The emit-time policy stack is honored, including from the
+           context copied for the executor.
         """
-        if level < min_level:
+        if not _level_allows(level, min_level):
             return None
         name = LEVEL_TO_NAME[level]
         event = _maybe_interpolate(event, args)
 
-        # Capture thread-specific info before handing off to the executor.
-        thread_token = _ASYNC_CALLING_THREAD.set(
-            (threading.get_ident(), threading.current_thread().name)
+        return await _run_in_executor_context(
+            self, lambda: self._proxy_to_logger(name, event, **kw)
         )
-        scs_token = _ASYNC_CALLING_STACK.set(sys._getframe().f_back)  # type: ignore[arg-type]
-        ctx = contextvars.copy_context()
-
-        try:
-            runner = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: ctx.run(
-                    lambda: self._proxy_to_logger(name, event, **kw)
-                ),
-            )
-        finally:
-            _ASYNC_CALLING_STACK.reset(scs_token)
-            _ASYNC_CALLING_THREAD.reset(thread_token)
-
-        return runner
 
     meths: dict[str, Callable[..., Any]] = {"log": log, "alog": alog}
     for lvl, name in LEVEL_TO_NAME.items():
@@ -258,8 +333,10 @@ def _make_filtering_bound_logger(min_level: int) -> type[FilteringBoundLogger]:
     meths["amsg"] = meths["ainfo"]
 
     # Introspection
-    meths["is_enabled_for"] = lambda self, level: level >= min_level
-    meths["get_effective_level"] = lambda self: min_level
+    meths["is_enabled_for"] = lambda self, level: _level_allows(
+        level, min_level
+    )
+    meths["get_effective_level"] = lambda self: _effective_min_level(min_level)
 
     return type(
         f"BoundLoggerFilteringAt{LEVEL_TO_NAME.get(min_level, 'Notset').capitalize()}",

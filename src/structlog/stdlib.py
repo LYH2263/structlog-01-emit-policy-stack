@@ -39,6 +39,10 @@ from .contextvars import (
     _ASYNC_CALLING_THREAD,
     merge_contextvars,
 )
+from .emit_policy import (
+    foreign_context_merge_skipped,
+    is_context_merge_processor,
+)
 from .exceptions import DropEvent
 from .processors import StackInfoRenderer
 from .typing import (
@@ -1133,6 +1137,103 @@ class ProcessorFormatter(logging.Formatter):
         self.pass_foreign_args = pass_foreign_args
         self.use_get_message = use_get_message
 
+    def _prepare_structlog_record(
+        self, record: logging.LogRecord
+    ) -> tuple[Any, str, EventDict]:
+        """
+        Prepare a record that went through `wrap_for_formatter`.
+
+        This branch deliberately does NOT consult
+        `foreign_context_merge_skipped`: both *pin* and
+        *structlog_passthrough* keep the passthrough handling of wrapped
+        records (no ``foreign_pre_chain``, emission-side context merge left
+        untouched).  See also `structlog_records_passthrough`.
+        """
+        logger = getattr(record, "_logger", _SENTINEL)
+        if self.logger is not None:
+            logger = self.logger
+
+        meth_name = cast(str, record._name)  # type:ignore[attr-defined]
+
+        # We need to copy because it's possible that the same record gets
+        # processed by multiple logging formatters. LogRecord.getMessage
+        # would transform our dict into a str.
+        ed = cast(dict[str, Any], record.msg).copy()
+        ed["_record"] = record
+        ed["_from_structlog"] = True
+
+        return logger, meth_name, ed
+
+    def _prepare_foreign_record(
+        self, record: logging.LogRecord
+    ) -> tuple[Any, str, EventDict, bool]:
+        """
+        Prepare a foreign `logging.LogRecord`.
+
+        The foreign branch is the only one that reads the
+        `foreign_context_merge_skipped` projection of the emit-time policy
+        stack; structlog records are routed through
+        `_prepare_structlog_record` instead.
+        """
+        logger = self.logger
+        meth_name = record.levelname.lower()
+        ed: EventDict = {
+            "event": (
+                record.getMessage()
+                if self.use_get_message
+                else str(record.msg)
+            ),
+            "_record": record,
+            "_from_structlog": False,
+        }
+
+        if self.pass_foreign_args:
+            ed["positional_args"] = record.args
+
+        record.args = ()
+
+        # Add stack-related attributes to the event dict
+        if record.exc_info:
+            ed["exc_info"] = record.exc_info
+        if record.stack_info:
+            ed["stack_info"] = record.stack_info
+
+        # With foreign_skip_context active, foreign records must not pass
+        # through a step that merges the structlog contextvars on the
+        # formatter side.
+        skip_context_merge = foreign_context_merge_skipped()
+
+        # Non-structlog allows to run through a chain to prepare it for the
+        # final processor (e.g. adding timestamps and log levels).
+        for proc in self.foreign_pre_chain or ():
+            if skip_context_merge and is_context_merge_processor(proc):
+                continue
+            ed = cast(EventDict, proc(logger, meth_name, ed))
+
+        return logger, meth_name, ed, skip_context_merge
+
+    def _run_formatter_processors(
+        self,
+        processors: Iterable[Processor],
+        logger: Any,
+        meth_name: str,
+        ed: ProcessorReturnValue,
+        *,
+        skip_context_merge: bool,
+    ) -> ProcessorReturnValue:
+        """
+        Run *processors*, skipping context-merge points when asked to.
+
+        The skip is the foreign-record projection only; it is never enabled
+        on the structlog-record branch.
+        """
+        for proc in processors:
+            if skip_context_merge and is_context_merge_processor(proc):
+                continue
+            ed = proc(logger, meth_name, ed)  # type: ignore[arg-type]
+
+        return ed
+
     def format(self, record: logging.LogRecord) -> str:
         """
         Extract *structlog*'s `event_dict` from ``record.msg`` and format it.
@@ -1148,46 +1249,18 @@ class ProcessorFormatter(logging.Formatter):
         meth_name = getattr(record, "_name", "__structlog_sentinel__")
 
         ed: ProcessorReturnValue
+        # The two branches read the stdlib_route dimension of the emit-time
+        # policy stack independently: a frame may only change the branch it
+        # names.  Structlog-sourced records have already run their emission
+        # processor chain (including any context-merge step), so a frame that
+        # changes how *foreign* records are merged must never affect them.
         if logger is not _SENTINEL and meth_name != "__structlog_sentinel__":
-            # Both attached by wrap_for_formatter
-            if self.logger is not None:
-                logger = self.logger
-            meth_name = cast(str, record._name)  # type:ignore[attr-defined]
-
-            # We need to copy because it's possible that the same record gets
-            # processed by multiple logging formatters. LogRecord.getMessage
-            # would transform our dict into a str.
-            ed = cast(dict[str, Any], record.msg).copy()
-            ed["_record"] = record
-            ed["_from_structlog"] = True
+            logger, meth_name, ed = self._prepare_structlog_record(record)
+            skip_context_merge = False
         else:
-            logger = self.logger
-            meth_name = record.levelname.lower()
-            ed = {
-                "event": (
-                    record.getMessage()
-                    if self.use_get_message
-                    else str(record.msg)
-                ),
-                "_record": record,
-                "_from_structlog": False,
-            }
-
-            if self.pass_foreign_args:
-                ed["positional_args"] = record.args
-
-            record.args = ()
-
-            # Add stack-related attributes to the event dict
-            if record.exc_info:
-                ed["exc_info"] = record.exc_info
-            if record.stack_info:
-                ed["stack_info"] = record.stack_info
-
-            # Non-structlog allows to run through a chain to prepare it for the
-            # final processor (e.g. adding timestamps and log levels).
-            for proc in self.foreign_pre_chain or ():
-                ed = cast(EventDict, proc(logger, meth_name, ed))
+            logger, meth_name, ed, skip_context_merge = (
+                self._prepare_foreign_record(record)
+            )
 
         # If required, unset stack-related attributes on the record copy so
         # that the base implementation doesn't append stacktraces to the
@@ -1198,8 +1271,13 @@ class ProcessorFormatter(logging.Formatter):
         if not self.keep_stack_info:
             record.stack_info = None
 
-        for p in self.processors:
-            ed = p(logger, meth_name, ed)  # type: ignore[arg-type]
+        ed = self._run_formatter_processors(
+            self.processors,
+            logger,
+            meth_name,
+            ed,
+            skip_context_merge=skip_context_merge,
+        )
 
         if not isinstance(ed, str):
             warnings.warn(

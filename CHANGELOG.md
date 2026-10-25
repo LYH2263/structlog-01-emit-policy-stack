@@ -13,6 +13,22 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 <!-- changelog follows -->
 
 
+## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
+
+
+### Added
+
+- New `structlog.emit_policy` module: an *emit-time policy stack* that is independent from both the process-wide `structlog.configure` defaults and the per-call key-values of `bind` / `structlog.contextvars.bound_contextvars`.
+
+  Each stack frame can scope three independent policy dimensions to the current `contextvars` context (and therefore to the current asyncio task / thread, including contexts copied for `run_in_executor`):
+
+  - `context_merge` changes how `structlog.contextvars.merge_contextvars` (and processors marked as equivalent merge points) merges context-local keys: `setdefault` (the pin), `context_wins` (same-named context keys override event/bound values), or `bound_only` (no merge for this frame).
+  - `level_gate` changes the method-level gate of `structlog.typing.FilteringBoundLogger`: `pin`, `raise_min` (the effective minimum level is the stricter of the frame floor and the wrapper class threshold), or `force_emit` (bypass the no-op while still running the full processor chain, without changing `structlog.DropEvent` semantics).
+  - `stdlib_route` changes how `structlog.stdlib.ProcessorFormatter` routes records, per branch: `pin`, `foreign_skip_context` (foreign records skip context-merge steps on the formatter side, structlog records are untouched), or `structlog_passthrough`.
+
+  Frames are pushed with `structlog.emit_policy.emit_policy` / `push_emit_policy` and popped on exit (also on exceptions); an empty stack is fully equivalent to the previous behavior.
+
+
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 
 ### Removed

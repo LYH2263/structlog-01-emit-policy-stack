@@ -371,6 +371,42 @@ def f() -> None:
         pass
 
 
+# emit-time policy stack
+
+
+with structlog.emit_policy.emit_policy(
+    context_merge=structlog.emit_policy.ContextMerge.CONTEXT_WINS,
+    level_gate=structlog.emit_policy.LevelGate.RAISE_MIN,
+    min_level=logging.WARNING,
+    stdlib_route=structlog.emit_policy.StdlibRoute.FOREIGN_SKIP_CONTEXT,
+):
+    fbl.info("scoped")
+
+with structlog.emit_policy.emit_policy(context_merge="bound_only"):
+    fbl.info("scoped")
+
+merge_mode: structlog.emit_policy.ContextMerge = (
+    structlog.emit_policy.get_context_merge()
+)
+gate: tuple[structlog.emit_policy.LevelGate, int] | None = (
+    structlog.emit_policy.get_level_gate()
+)
+route: structlog.emit_policy.StdlibRoute = (
+    structlog.emit_policy.get_stdlib_route()
+)
+view: structlog.emit_policy.EmitPolicyFrame = (
+    structlog.emit_policy.get_effective_policy()
+)
+if gate is not None:
+    gate_mode: structlog.emit_policy.LevelGate = gate[0]
+    gate_floor: int = gate[1]
+    assert gate_mode is structlog.emit_policy.LevelGate.PIN
+    assert gate_floor == logging.NOTSET
+assert merge_mode is structlog.emit_policy.ContextMerge.SETDEFAULT
+assert route is structlog.emit_policy.StdlibRoute.PIN
+assert view.context_merge is not None
+
+
 # ConsoleRenderer properties
 
 cr = structlog.dev.ConsoleRenderer.get_active()

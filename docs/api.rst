@@ -139,6 +139,37 @@ API Reference
 .. autofunction:: unbind_contextvars
 .. autofunction:: reset_contextvars
 
+`structlog.emit_policy` Module
+-------------------------------
+
+.. automodule:: structlog.emit_policy
+
+.. autoclass:: ContextMerge
+   :members:
+
+.. autoclass:: LevelGate
+   :members:
+
+.. autoclass:: StdlibRoute
+   :members:
+
+.. autoclass:: EmitPolicyFrame
+   :members:
+
+.. autofunction:: emit_policy
+.. autofunction:: push_emit_policy
+.. autofunction:: pop_emit_policy
+.. autofunction:: get_effective_policy
+.. autofunction:: get_context_merge
+.. autofunction:: get_level_gate
+.. autofunction:: get_stdlib_route
+.. autofunction:: foreign_context_merge_skipped
+.. autofunction:: structlog_records_passthrough
+.. autofunction:: apply_context_merge
+.. autofunction:: mark_context_merge_processor
+.. autofunction:: is_context_merge_processor
+
+
 `structlog.threadlocal` Module
 ------------------------------
 

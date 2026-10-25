@@ -10,7 +10,6 @@ import pytest
 
 from structlog import make_filtering_bound_logger
 from structlog._log_levels import LEVEL_TO_NAME
-from structlog._native import _nop
 from structlog.contextvars import (
     bind_contextvars,
     clear_contextvars,
@@ -372,11 +371,13 @@ class TestNativeFilteringLogger:
 
         assert [("info", (), {"event": "hey %! %%!"})] == cl.calls
 
-    def test_log_level_str(self):
+    def test_log_level_str(self, cl):
         """
         *min_level* can be a string and the case doesn't matter.
         """
-        bl = make_filtering_bound_logger("wArNiNg")
+        bl = make_filtering_bound_logger("wArNiNg")(cl, [], {})
 
-        assert bl.warning is not _nop
-        assert bl.info is _nop
+        bl.info("nope")
+        bl.warning("yep")
+
+        assert [("warning", (), {"event": "yep"})] == cl.calls

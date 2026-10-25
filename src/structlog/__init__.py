@@ -9,6 +9,7 @@ from __future__ import annotations
 from structlog import (
     contextvars,
     dev,
+    emit_policy,
     processors,
     stdlib,
     testing,
@@ -72,6 +73,7 @@ __all__ = [
     "configure_once",
     "contextvars",
     "dev",
+    "emit_policy",
     "getLogger",
     "get_config",
     "get_context",
